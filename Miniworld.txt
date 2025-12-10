@@ -1,0 +1,220 @@
+Miniworld fork repo summary:
+
+https://github.com/NomanTrips/Miniworld.git
+
+The repository extends the manual controller to mix continuous mouse-look with keyboard navigation: the pyglet event loop captures keyboard state for arrows/WASD to drive forward, backward, and strafing speeds while accumulating mouse deltas for yaw and pitch with configurable sensitivity and a deadzone before mapping them into the environment’s 6-D action vector, supporting both Box and discrete action spaces and keeping the cursor recentered for exclusive mouse capture. Fullscreen toggling and mouse exclusivity are maintained across windowed/fullscreen modes so the cursor stays locked while controlling the agent, aligning the interactive experience with typical FPS-style controls.
+
+Dataset capture is wired into the same controller: pressing space starts/stops an EpisodeWriter, with frames, normalized actions, agent state vectors, and timestamps buffered per episode and flushed when the window closes, enabling clean manual demonstrations saved under episode_recordings with task descriptions and optional append mode for multi-session capture. The underlying DatasetManager writes chunked MP4 videos and Parquet tables in a LeRobot-compatible schema, tracks dataset statistics, tasks metadata, and episode ranges, and supports resumable recording by loading existing info/episode/task files when append is set, ensuring captured rollouts are organized and self-describing.
+
+
+Sample SmolVLA eval script:
+
+# closed_loop_eval.py
+
+#!/usr/bin/env python3
+"""
+Closed-loop PTZ evaluation:
+- Read full frames from a source video
+- Render viewport via synthetic rig
+- Feed viewport -> SmolVLA -> predicted (dpan, dtilt, dzoom)
+- Apply action to rig
+- Save the sequence of rendered viewports as an MP4
+"""
+
+import argparse
+from pathlib import Path
+
+import cv2
+import numpy as np
+import torch
+
+# --- LeRobot / SmolVLA ---
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
+from lerobot.policies.factory import make_pre_post_processors
+
+# --- Your rig & video reader ---
+from ptz_poc import VideoReader, Rig
+
+
+def parse_args():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--video", required=True, type=Path, help="Path to input video")
+    ap.add_argument("--policy", required=True, type=str, help="SmolVLA checkpoint dir or Hub repo")
+    ap.add_argument("--dataset", required=True, type=str,
+                    help="HF repo-id or local root to read stats from (must match training stats)")
+    ap.add_argument("--device", default="cuda", choices=["cuda", "cpu"])
+    ap.add_argument("--out", required=True, type=Path, help="Output MP4 path")
+    ap.add_argument("--size", type=int, default=256, help="Viewport (square) output size")
+    ap.add_argument("--fps", type=float, default=30.0, help="Target playback FPS if source missing")
+    # Optional deadband/hysteresis for steadier behavior at inference
+    ap.add_argument("--tau_on", type=float, default=0.0, help="Hysteresis ON threshold (0 to disable gating)")
+    ap.add_argument("--tau_off", type=float, default=0.0, help="Hysteresis OFF threshold (<= tau_on)")
+    # Rig params (match your capture-time settings if applicable)
+    ap.add_argument("--fov_x_deg", type=float, default=80.0)
+    ap.add_argument("--fov_y_deg", type=float, default=60.0)
+    ap.add_argument("--zoom_alpha", type=float, default=1.5)
+    ap.add_argument("--max_dpan", type=float, default=5.0)
+    ap.add_argument("--max_dtilt", type=float, default=5.0)
+    ap.add_argument("--max_dzoom", type=float, default=0.1)
+    ap.add_argument("--task", type=str, default="Center and zoom on the target",
+                help="Instruction/task text expected by the tokenizer processor")
+    return ap.parse_args()
+
+
+def build_transition(viewport_uint8_hw3, device: str, task_text: str, policy, rig) -> dict:
+    # image -> float32 [0,1]
+    x = (
+        torch.from_numpy(viewport_uint8_hw3)
+        .permute(2, 0, 1).unsqueeze(0).to(device).float() / 255.0
+    )
+
+    # detect the policy’s expected image key (e.g., 'observation.image')
+    img_feat_key = next(
+        (k for k in getattr(policy.config, "input_features", {}).keys()
+         if "observation" in k and "image" in k),
+        "observation.image",
+    )
+    nested_img_key = img_feat_key.split("observation.", 1)[-1]
+
+    # ---- add STATE ----
+    s = torch.tensor(
+        [[rig.state.pan_deg, rig.state.tilt_deg, rig.state.zoom_norm]],
+        dtype=torch.float32, device=device
+    )
+    state_key = "observation.state"           # what SmolVLA uses internally
+    nested_state_key = "state"
+
+    return {
+        "observation": {
+            nested_img_key: x,
+            nested_state_key: s,
+        },
+        img_feat_key: x,                      # flat (belt + suspenders)
+        state_key: s,                         # flat state key SmolVLA reads
+        "complementary_data": {"task": task_text},
+        "task": task_text,
+    }
+
+
+
+
+
+class GateState:
+    """Simple hysteresis gate for 'should move' logic."""
+    def __init__(self):
+        self.moving = False
+
+    def gate(self, a: np.ndarray, tau_on: float, tau_off: float) -> np.ndarray:
+        if tau_on <= 0.0:  # disabled
+            return a
+        mag = float(np.linalg.norm(a))
+        if self.moving:
+            if mag < tau_off:
+                self.moving = False
+                return np.zeros_like(a)
+            return a
+        else:
+            if mag < tau_on:
+                return np.zeros_like(a)
+            self.moving = True
+            return a
+
+
+def main():
+    args = parse_args()
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+
+    # 1) Load dataset stats (for normalization) and the trained policy
+    ds = LeRobotDataset(repo_id=args.dataset, force_cache_sync=True)
+    policy = SmolVLAPolicy.from_pretrained(args.policy)
+    policy.eval().to(args.device)
+
+    # 2) Build pre/post using the model's config + dataset stats
+    pre, post = make_pre_post_processors(
+        policy_cfg=policy.config,
+        pretrained_path=args.policy,
+        preprocessor_overrides={
+            "device_processor": {"device": str(args.device)},
+            "normalizer_processor": {
+                "stats": ds.meta.stats,
+                "features": {**policy.config.input_features, **policy.config.output_features},
+                "norm_map": policy.config.normalization_mapping,
+            },
+            "tokenizer_processor": {
+                "task_key": "task",   # read complementary_data["task"]
+            },
+        },
+        postprocessor_overrides={
+            "unnormalizer_processor": {
+                "stats": ds.meta.stats,
+                "features": policy.config.output_features,
+                "norm_map": policy.config.normalization_mapping,
+            }
+        },
+    )
+
+
+    # 3) Video IO
+    reader = VideoReader(args.video)
+    src_fps = reader.info.fps if (reader.info.fps and reader.info.fps > 0) else args.fps
+    W = H = int(args.size)
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(str(args.out), fourcc, float(src_fps), (W, H))
+
+    # 4) Synthetic rig (start centered)
+    rig = Rig(
+        fov_x_deg=args.fov_x_deg,
+        fov_y_deg=args.fov_y_deg,
+        output_size=(H, W),
+        zoom_alpha=args.zoom_alpha,
+        max_deltas=(args.max_dpan, args.max_dtilt, args.max_dzoom),
+    )
+
+    gate = GateState()
+
+    with torch.no_grad():
+        for full_frame, _pts_sec in reader:
+            # Render current viewport from rig pose
+            viewport = rig.render(full_frame)            # (H, W, 3), uint8
+
+            # Build minimal batch and preprocess
+            batch = build_transition(viewport, args.device, args.task, policy, rig)
+
+            #print("[DBG] keys:", list(batch.keys()))
+            #print("[DBG] obs keys:", list(batch["observation"].keys()))
+            #print("[DBG] comp keys:", list(batch.get("complementary_data", {}).keys()))
+            #print("[DBG] task:", batch.get("complementary_data", {}).get("task"))
+
+            batch = pre(batch)
+
+
+            # Predict action, then unnormalize/postprocess
+            action = policy.select_action(batch)         # tensor (1, D)
+            action = post(action)                        # back to real units
+            if isinstance(action, torch.Tensor):
+                a = action.squeeze(0).detach().cpu().numpy().astype(np.float32)
+            else:
+                a = np.asarray(action, dtype=np.float32)
+
+            # Optional inference hysteresis (prevents tiny jitters → no-ops)
+            a = gate.gate(a, tau_on=args.tau_on, tau_off=args.tau_off)
+
+            # Apply to rig
+            rig.apply(float(a[0]), float(a[1]), float(a[2]))
+
+            # (Optional) annotate the frame with the action
+            out = viewport.copy()
+            txt = f"dpan={a[0]:+.2f}  dtilt={a[1]:+.2f}  dzoom={a[2]:+.2f}"
+            cv2.putText(out, txt, (8, H - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+
+            # Write result
+            writer.write(out)
+
+    writer.release()
+    print(f"Saved closed-loop video to: {args.out}")
+
+
+if __name__ == "__main__":
+    main()
