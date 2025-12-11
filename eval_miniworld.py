@@ -19,6 +19,7 @@ import gymnasium as gym
 import miniworld
 import numpy as np
 import torch
+from lerobot.processor.core import TransitionKey
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.policies.factory import make_pre_post_processors
 from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
@@ -432,9 +433,9 @@ def main() -> None:
             raw_obs["image" if "image" in input_features else "rgb"] = render_frame
 
         return {
-            "observation": raw_obs,
+            TransitionKey.OBSERVATION: raw_obs,
             "task": args.task,
-            "complementary_data": {"task": args.task},
+            TransitionKey.COMPLEMENTARY_DATA: {"task": args.task},
         }
 
     env = None
