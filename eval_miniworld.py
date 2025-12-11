@@ -413,7 +413,7 @@ def main() -> None:
             return type(batch)(move_to_device(v) for v in batch)
         return batch
 
-    def build_policy_observation(observation, render_frame):
+    def build_policy_transition(observation, render_frame):
         raw_obs: dict[str, object] = {}
         if isinstance(observation, dict):
             for feature in input_features:
@@ -431,8 +431,11 @@ def main() -> None:
         if not raw_obs:
             raw_obs["image" if "image" in input_features else "rgb"] = render_frame
 
-        raw_obs["task"] = args.task
-        return raw_obs
+        return {
+            "observation": raw_obs,
+            "task": args.task,
+            "complementary_data": {"task": args.task},
+        }
 
     env = None
     manual_recorder: ManualVideoRecorder | None = None
@@ -491,8 +494,8 @@ def main() -> None:
                     logging.info("Stopping due to max step limit %s", max_steps)
                     break
 
-                raw_obs = build_policy_observation(obs, render)
-                processed_inputs = preprocessor(raw_obs)
+                transition = build_policy_transition(obs, render)
+                processed_inputs = preprocessor(transition)
                 processed_inputs = move_to_device(processed_inputs)
 
                 action_output = policy.select_action(processed_inputs)
