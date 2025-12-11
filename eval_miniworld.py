@@ -20,6 +20,8 @@ import miniworld
 import numpy as np
 import torch
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from smol_vla.data.utils import make_pre_post_processors
+from smol_vla.policies.base_policy import SmolVLAPolicy
 
 
 @dataclass
@@ -140,11 +142,12 @@ def setup_recording(env: gym.Env, outdir: Path) -> tuple[gym.Env, ManualVideoRec
     return env, ManualVideoRecorder(video_path, fps)
 
 
-def existing_file(path_str: str) -> Path:
-    """Argparse helper to require an existing file path."""
+def existing_path(path_str: str) -> Path:
+    """Argparse helper to require an existing file or directory path."""
+
     path = Path(path_str).expanduser().resolve()
-    if not path.is_file():
-        raise argparse.ArgumentTypeError(f"Policy path does not exist or is not a file: {path}")
+    if not path.exists():
+        raise argparse.ArgumentTypeError(f"Policy path does not exist: {path}")
     return path
 
 
@@ -155,6 +158,23 @@ def dir_path(path_str: str) -> Path:
         raise argparse.ArgumentTypeError(f"Output path exists and is not a directory: {path}")
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def parse_mapping(pairs: Optional[list[str]]) -> dict[str, str]:
+    """Parse CLI KEY=VALUE pairs into a dictionary."""
+
+    mapping: dict[str, str] = {}
+    if not pairs:
+        return mapping
+
+    for pair in pairs:
+        if "=" not in pair:
+            raise argparse.ArgumentTypeError("Normalization mapping entries must be KEY=VALUE pairs")
+        key, value = pair.split("=", maxsplit=1)
+        if not key or not value:
+            raise argparse.ArgumentTypeError("Normalization mapping entries must include both key and value")
+        mapping[key] = value
+    return mapping
 
 
 def parse_args(args: Optional[list[str]] = None) -> argparse.Namespace:
@@ -192,8 +212,8 @@ def parse_args(args: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--policy",
         required=True,
-        type=existing_file,
-        help="Path to the trained SmolVLA policy checkpoint",
+        type=existing_path,
+        help="Path to the trained SmolVLA policy checkpoint directory or file",
     )
     parser.add_argument(
         "--dataset",
@@ -217,6 +237,25 @@ def parse_args(args: Optional[list[str]] = None) -> argparse.Namespace:
         type=int,
         default=0,
         help="Random seed applied to Python, NumPy, Torch, and the environment",
+    )
+    parser.add_argument(
+        "--input-features",
+        nargs="+",
+        default=None,
+        help="Optional override for policy input feature names (defaults to checkpoint config)",
+    )
+    parser.add_argument(
+        "--output-features",
+        nargs="+",
+        default=None,
+        help="Optional override for policy output feature names (defaults to checkpoint config)",
+    )
+    parser.add_argument(
+        "--normalization-mapping",
+        nargs="*",
+        default=None,
+        metavar="KEY=VALUE",
+        help="Mapping from policy feature names to dataset statistic keys (e.g., image=rgb)",
     )
 
     return parser.parse_args(args=args)
@@ -263,6 +302,9 @@ def main() -> None:
     logging.info("Output dir: %s", args.outdir)
     logging.info("Max seconds: %s", args.max_seconds)
     logging.info("Seed: %s", args.seed)
+    logging.info("Input features override: %s", args.input_features)
+    logging.info("Output features override: %s", args.output_features)
+    logging.info("Normalization mapping override: %s", args.normalization_mapping)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logging.info("Using device: %s", device)
@@ -291,32 +333,59 @@ def main() -> None:
         logging.info("Output unnormalizers available for: %s", ", ".join(sorted(output_normalizers)))
     logging.info("Dataset statistics loaded from dataset metadata")
 
-    model = torch.load(args.policy, map_location=device)
-    model.to(device)
-    model.eval()
+    policy = SmolVLAPolicy.from_pretrained(args.policy)
+    policy.to(device)
+    policy.eval()
 
-    def prepare_batch(image, state: Optional[torch.Tensor] = None) -> dict:
-        """Construct a model-ready batch containing image, optional state, and task text."""
+    policy_config = getattr(policy, "config", {}) or {}
+    normalization_mapping = parse_mapping(args.normalization_mapping)
+    if not normalization_mapping:
+        normalization_mapping = policy_config.get("normalization_mapping", {})
 
-        if isinstance(image, torch.Tensor):
-            image_tensor = image
-        else:
-            image_tensor = torch.from_numpy(image)
-        if image_tensor.dim() == 3:
-            image_tensor = image_tensor.permute(2, 0, 1)
-        image_tensor = image_tensor.float().unsqueeze(0).to(device)
+    input_features = args.input_features or policy_config.get("input_features") or []
+    output_features = args.output_features or policy_config.get("output_features") or []
 
-        if "image" in input_normalizers:
-            norm = input_normalizers["image"].to(device)
-            image_tensor = norm.normalize(image_tensor)
+    preprocessor, postprocessor = make_pre_post_processors(
+        policy_config,
+        ds.meta.stats,
+        input_features=input_features or None,
+        output_features=output_features or None,
+        normalization_mapping=normalization_mapping or None,
+    )
 
-        batch: dict[str, torch.Tensor | str] = {"image": image_tensor, "task": args.task}
-        if state is not None:
-            batch["state"] = state.to(device)
-            if "state" in input_normalizers:
-                norm = input_normalizers["state"].to(device)
-                batch["state"] = norm.normalize(batch["state"])
+    logging.info("Policy input features: %s", input_features)
+    logging.info("Policy output features: %s", output_features)
+    logging.info("Using normalization mapping: %s", normalization_mapping)
+
+    def move_to_device(batch: dict | torch.Tensor | list | tuple):
+        if isinstance(batch, torch.Tensor):
+            return batch.to(device)
+        if isinstance(batch, dict):
+            return {k: move_to_device(v) for k, v in batch.items()}
+        if isinstance(batch, (list, tuple)):
+            return type(batch)(move_to_device(v) for v in batch)
         return batch
+
+    def build_policy_observation(observation, render_frame):
+        raw_obs: dict[str, object] = {}
+        if isinstance(observation, dict):
+            for feature in input_features:
+                if feature in observation:
+                    raw_obs[feature] = observation[feature]
+            if "state" in observation and "state" not in raw_obs:
+                raw_obs["state"] = observation["state"]
+
+        for feature in input_features:
+            if feature in raw_obs:
+                continue
+            if feature in ("image", "rgb", "pixels"):
+                raw_obs[feature] = render_frame
+
+        if not raw_obs:
+            raw_obs["image" if "image" in input_features else "rgb"] = render_frame
+
+        raw_obs["task"] = args.task
+        return raw_obs
 
     env = None
     manual_recorder: ManualVideoRecorder | None = None
@@ -361,27 +430,22 @@ def main() -> None:
                     logging.info("Stopping due to max step limit %s", max_steps)
                     break
 
-                state_tensor = None
-                if isinstance(obs, dict):
-                    image = obs.get("image", render)
-                    if "state" in obs:
-                        state_tensor = torch.tensor(obs["state"])
-                else:
-                    image = render
+                raw_obs = build_policy_observation(obs, render)
+                processed_inputs = preprocessor(raw_obs)
+                processed_inputs = move_to_device(processed_inputs)
 
-                batch = prepare_batch(image, state_tensor)
-                action_tensor = model(batch)
-                if isinstance(action_tensor, dict) and "action" in action_tensor:
-                    action_tensor = action_tensor["action"]
-                if isinstance(action_tensor, torch.Tensor):
-                    if "action" in output_normalizers:
-                        unnorm = output_normalizers["action"].to(device)
-                        action_tensor = unnorm.unnormalize(action_tensor)
-                    action = action_tensor.squeeze().detach().cpu().numpy()
+                action_output = policy.select_action(processed_inputs)
+                action_post = postprocessor(action_output)
+                action_value = (
+                    action_post["action"] if isinstance(action_post, dict) and "action" in action_post else action_post
+                )
+
+                if isinstance(action_value, torch.Tensor):
+                    action = action_value.squeeze().detach().cpu().numpy()
                     if action.shape == ():
                         action = int(action.item())
                 else:
-                    action = action_tensor
+                    action = action_value
 
                 obs, reward, done, truncated, info = env.step(action)
                 render = env.render()
