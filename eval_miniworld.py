@@ -446,6 +446,38 @@ def main() -> None:
         state_source = observation.get("state") if isinstance(observation, dict) else None
         render_tensor = to_image_tensor(render_frame)
 
+        requires_state = any("state" in feature for feature in feature_names)
+        state_tensor: torch.Tensor | None = None
+
+        if requires_state:
+            if state_source is not None:
+                state_tensor = to_tensor(state_source)
+            elif env is not None:
+                state_components: list[float] = []
+                try:
+                    unwrapped = env.unwrapped
+                    agent = getattr(unwrapped, "agent", unwrapped)
+                    pos = getattr(agent, "pos", None)
+                    direction = getattr(agent, "dir", getattr(agent, "direction", None))
+                    pitch = getattr(agent, "pitch", None)
+
+                    if pos is not None:
+                        state_components.extend(np.asarray(pos, dtype=np.float32).flatten().tolist())
+                    if direction is not None:
+                        state_components.append(float(direction))
+                    if pitch is not None:
+                        state_components.append(float(pitch))
+
+                    if state_components:
+                        state_tensor = torch.tensor([state_components], dtype=torch.float32)
+                        logging.info("Synthesized observation.state from env agent attributes (pos/dir/pitch)")
+                except Exception as exc:  # pragma: no cover - best effort debug info
+                    logging.debug("Unable to extract env agent state: %s", exc)
+
+            if state_tensor is None:
+                state_tensor = torch.zeros((1, 5), dtype=torch.float32)
+                logging.info("Observation missing state; using zero state tensor shaped %s", tuple(state_tensor.shape))
+
         for feature in feature_names:
             nested_key = feature.split("observation.", 1)[-1] if feature.startswith("observation.") else feature
             value = None
@@ -456,14 +488,18 @@ def main() -> None:
 
             if value is None and any(token in feature for token in ("image", "rgb", "pixels")):
                 value = render_tensor
-            if value is None and "state" in feature and state_source is not None:
-                value = to_tensor(state_source)
+            if value is None and "state" in feature and state_tensor is not None:
+                value = state_tensor
 
             if value is None:
                 continue
 
             flat_obs[feature] = value
             nested_obs[nested_key] = value
+
+        if state_tensor is not None:
+            nested_obs.setdefault("state", state_tensor)
+            flat_obs.setdefault("observation.state", state_tensor)
 
         if not nested_obs:
             default_key = "image" if "image" in feature_names else feature_names[0] if feature_names else "image"
