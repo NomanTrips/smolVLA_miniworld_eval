@@ -437,14 +437,28 @@ def main() -> None:
     env = None
     manual_recorder: ManualVideoRecorder | None = None
 
+    obs_width = 512
+    obs_height = 512
+
+    logging.info(
+        "Configuring MiniWorld render at %sx%s (HUD %s, mouse sensitivity=%s)",
+        obs_width,
+        obs_height,
+        "hidden" if args.hide_hud else "visible",
+        args.mouse_sensitivity,
+    )
+
     try:
         env = gym.make(
             args.env_name,
             render_mode="rgb_array",
-            fullscreen=args.fullscreen,
-            mouse_sensitivity=args.mouse_sensitivity,
-            hide_hud=args.hide_hud,
+            show_hud=not args.hide_hud,
+            obs_width=obs_width,
+            obs_height=obs_height,
         )
+
+        if hasattr(env, "mouse_sensitivity"):
+            setattr(env, "mouse_sensitivity", args.mouse_sensitivity)
 
         env.action_space.seed(args.seed)
         if hasattr(env, "observation_space"):
