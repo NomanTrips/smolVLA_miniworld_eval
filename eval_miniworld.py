@@ -7,7 +7,6 @@ logging for a MiniWorld rollout.
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import random
 import time
@@ -20,6 +19,7 @@ import gymnasium as gym
 import miniworld
 import numpy as np
 import torch
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 
 @dataclass
@@ -51,50 +51,19 @@ def _load_stats_section(section: dict) -> dict[str, Normalizer]:
     return normalizers
 
 
-def find_stats_path(dataset_path: Path) -> Path:
-    candidates = [
-        dataset_path / "dataset_statistics.json",
-        dataset_path / "statistics.json",
-        dataset_path / "stats.json",
-    ]
-    for candidate in candidates:
-        if candidate.is_file():
-            return candidate
-    raise FileNotFoundError(
-        f"Dataset statistics not found in {dataset_path}. Tried: {', '.join(str(p) for p in candidates)}"
-    )
-
-
-def load_dataset_statistics(dataset_path: Path) -> tuple[dict[str, Normalizer], dict[str, Normalizer], Path]:
-    stats_path = find_stats_path(dataset_path)
-    with stats_path.open("r", encoding="utf-8") as fp:
-        stats = json.load(fp)
-
+def load_dataset_statistics_from_meta(stats: dict) -> tuple[dict[str, Normalizer], dict[str, Normalizer]]:
     input_section = stats.get("inputs") or {}
     output_section = stats.get("outputs") or {}
-
-    if not input_section and not output_section:
-        # Fallback: flat keys ending with _mean/_std
-        grouped: dict[str, dict[str, list[float] | float]] = {}
-        for key, value in stats.items():
-            if key.endswith("_mean"):
-                base = key[: -len("_mean")]
-                grouped.setdefault(base, {})["mean"] = value
-            elif key.endswith("_std"):
-                base = key[: -len("_std")]
-                grouped.setdefault(base, {})["std"] = value
-        input_section = grouped
 
     input_normalizers = _load_stats_section(input_section)
     output_normalizers = _load_stats_section(output_section)
 
     logging.info(
-        "Loaded dataset statistics from %s (inputs=%s, outputs=%s)",
-        stats_path,
+        "Loaded dataset statistics from LeRobot meta (inputs=%s, outputs=%s)",
         sorted(input_normalizers.keys()),
         sorted(output_normalizers.keys()),
     )
-    return input_normalizers, output_normalizers, stats_path
+    return input_normalizers, output_normalizers
 
 
 class ManualVideoRecorder:
@@ -179,14 +148,6 @@ def existing_file(path_str: str) -> Path:
     return path
 
 
-def existing_path(path_str: str) -> Path:
-    """Argparse helper to require an existing path (file or directory)."""
-    path = Path(path_str).expanduser().resolve()
-    if not path.exists():
-        raise argparse.ArgumentTypeError(f"Dataset path does not exist: {path}")
-    return path
-
-
 def dir_path(path_str: str) -> Path:
     """Argparse helper for output directory creation."""
     path = Path(path_str).expanduser().resolve()
@@ -237,8 +198,7 @@ def parse_args(args: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--dataset",
         required=True,
-        type=existing_path,
-        help="Path to the dataset or Hugging Face repo used for normalization",
+        help="Dataset repo ID or local path used for normalization",
     )
     parser.add_argument(
         "--outdir",
@@ -307,12 +267,29 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logging.info("Using device: %s", device)
 
-    input_normalizers, output_normalizers, stats_path = load_dataset_statistics(args.dataset)
+    ds = LeRobotDataset(repo_id=args.dataset, force_cache_sync=True)
+    dataset_root = next(
+        (
+            Path(value)
+            for value in (
+                getattr(ds, attr, None)
+                for attr in ("data_dir", "repo_path", "cache_dir", "root", "dataset_dir")
+            )
+            if value
+        ),
+        None,
+    )
+    if dataset_root:
+        logging.info("LeRobot dataset cached at: %s", dataset_root)
+    else:
+        logging.info("LeRobot dataset cache path not available on dataset object")
+
+    input_normalizers, output_normalizers = load_dataset_statistics_from_meta(ds.meta.stats)
     if input_normalizers:
         logging.info("Input normalizers available for: %s", ", ".join(sorted(input_normalizers)))
     if output_normalizers:
         logging.info("Output unnormalizers available for: %s", ", ".join(sorted(output_normalizers)))
-    logging.info("Dataset statistics resolved from: %s", stats_path)
+    logging.info("Dataset statistics loaded from dataset metadata")
 
     model = torch.load(args.policy, map_location=device)
     model.to(device)
