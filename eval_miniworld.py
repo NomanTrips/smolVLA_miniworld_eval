@@ -7,14 +7,94 @@ logging for a MiniWorld rollout.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
+import random
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
 import cv2
 import gymnasium as gym
+import miniworld
+import numpy as np
 import torch
+
+
+@dataclass
+class Normalizer:
+    """Simple tensor normalizer/unnormalizer using mean and std statistics."""
+
+    mean: torch.Tensor
+    std: torch.Tensor
+
+    def normalize(self, tensor: torch.Tensor) -> torch.Tensor:
+        return (tensor - self.mean) / self.std
+
+    def unnormalize(self, tensor: torch.Tensor) -> torch.Tensor:
+        return tensor * self.std + self.mean
+
+    def to(self, device: torch.device) -> Normalizer:
+        return Normalizer(self.mean.to(device), self.std.to(device))
+
+
+def _load_stats_section(section: dict) -> dict[str, Normalizer]:
+    normalizers: dict[str, Normalizer] = {}
+    for key, values in section.items():
+        if not isinstance(values, dict) or "mean" not in values or "std" not in values:
+            logging.warning("Skipping malformed stats entry for %s", key)
+            continue
+        mean = torch.tensor(values["mean"], dtype=torch.float32)
+        std = torch.tensor(values["std"], dtype=torch.float32).clamp(min=1e-6)
+        normalizers[key] = Normalizer(mean=mean, std=std)
+    return normalizers
+
+
+def find_stats_path(dataset_path: Path) -> Path:
+    candidates = [
+        dataset_path / "dataset_statistics.json",
+        dataset_path / "statistics.json",
+        dataset_path / "stats.json",
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    raise FileNotFoundError(
+        f"Dataset statistics not found in {dataset_path}. Tried: {', '.join(str(p) for p in candidates)}"
+    )
+
+
+def load_dataset_statistics(dataset_path: Path) -> tuple[dict[str, Normalizer], dict[str, Normalizer], Path]:
+    stats_path = find_stats_path(dataset_path)
+    with stats_path.open("r", encoding="utf-8") as fp:
+        stats = json.load(fp)
+
+    input_section = stats.get("inputs") or {}
+    output_section = stats.get("outputs") or {}
+
+    if not input_section and not output_section:
+        # Fallback: flat keys ending with _mean/_std
+        grouped: dict[str, dict[str, list[float] | float]] = {}
+        for key, value in stats.items():
+            if key.endswith("_mean"):
+                base = key[: -len("_mean")]
+                grouped.setdefault(base, {})["mean"] = value
+            elif key.endswith("_std"):
+                base = key[: -len("_std")]
+                grouped.setdefault(base, {})["std"] = value
+        input_section = grouped
+
+    input_normalizers = _load_stats_section(input_section)
+    output_normalizers = _load_stats_section(output_section)
+
+    logging.info(
+        "Loaded dataset statistics from %s (inputs=%s, outputs=%s)",
+        stats_path,
+        sorted(input_normalizers.keys()),
+        sorted(output_normalizers.keys()),
+    )
+    return input_normalizers, output_normalizers, stats_path
 
 
 class ManualVideoRecorder:
@@ -172,6 +252,12 @@ def parse_args(args: Optional[list[str]] = None) -> argparse.Namespace:
         default=60,
         help="Maximum allowed episode duration in seconds",
     )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="Random seed applied to Python, NumPy, Torch, and the environment",
+    )
 
     return parser.parse_args(args=args)
 
@@ -190,9 +276,21 @@ def setup_logging(outdir: Path) -> None:
     logging.info("Logging initialized. Writing to %s", log_path)
 
 
+def seed_everything(seed: int) -> None:
+    logging.info("Seeding Python, NumPy, Torch with seed=%s", seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
 def main() -> None:
     args = parse_args()
     setup_logging(args.outdir)
+
+    logging.info("Resolved miniworld module path: %s", Path(miniworld.__file__).resolve())
+    seed_everything(args.seed)
 
     logging.info("Starting MiniWorld eval")
     logging.info("Environment: %s", args.env_name)
@@ -204,9 +302,17 @@ def main() -> None:
     logging.info("Dataset: %s", args.dataset)
     logging.info("Output dir: %s", args.outdir)
     logging.info("Max seconds: %s", args.max_seconds)
+    logging.info("Seed: %s", args.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logging.info("Using device: %s", device)
+
+    input_normalizers, output_normalizers, stats_path = load_dataset_statistics(args.dataset)
+    if input_normalizers:
+        logging.info("Input normalizers available for: %s", ", ".join(sorted(input_normalizers)))
+    if output_normalizers:
+        logging.info("Output unnormalizers available for: %s", ", ".join(sorted(output_normalizers)))
+    logging.info("Dataset statistics resolved from: %s", stats_path)
 
     model = torch.load(args.policy, map_location=device)
     model.to(device)
@@ -223,9 +329,16 @@ def main() -> None:
             image_tensor = image_tensor.permute(2, 0, 1)
         image_tensor = image_tensor.float().unsqueeze(0).to(device)
 
+        if "image" in input_normalizers:
+            norm = input_normalizers["image"].to(device)
+            image_tensor = norm.normalize(image_tensor)
+
         batch: dict[str, torch.Tensor | str] = {"image": image_tensor, "task": args.task}
         if state is not None:
             batch["state"] = state.to(device)
+            if "state" in input_normalizers:
+                norm = input_normalizers["state"].to(device)
+                batch["state"] = norm.normalize(batch["state"])
         return batch
 
     env = None
@@ -240,9 +353,13 @@ def main() -> None:
             hide_hud=args.hide_hud,
         )
 
+        env.action_space.seed(args.seed)
+        if hasattr(env, "observation_space"):
+            env.observation_space.seed(args.seed)
+
         env, manual_recorder = setup_recording(env, args.outdir)
 
-        obs, info = env.reset()
+        obs, info = env.reset(seed=args.seed)
         render = env.render()
         logging.info("Environment reset: observation keys=%s", list(obs.keys()) if isinstance(obs, dict) else type(obs))
 
@@ -280,6 +397,9 @@ def main() -> None:
                 if isinstance(action_tensor, dict) and "action" in action_tensor:
                     action_tensor = action_tensor["action"]
                 if isinstance(action_tensor, torch.Tensor):
+                    if "action" in output_normalizers:
+                        unnorm = output_normalizers["action"].to(device)
+                        action_tensor = unnorm.unnormalize(action_tensor)
                     action = action_tensor.squeeze().detach().cpu().numpy()
                     if action.shape == ():
                         action = int(action.item())
