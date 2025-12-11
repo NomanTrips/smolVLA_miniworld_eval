@@ -20,8 +20,8 @@ import miniworld
 import numpy as np
 import torch
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
-from smol_vla.data.utils import make_pre_post_processors
-from smol_vla.policies.base_policy import SmolVLAPolicy
+from lerobot.policies.factory import make_pre_post_processors
+from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 
 
 @dataclass
@@ -338,19 +338,66 @@ def main() -> None:
     policy.eval()
 
     policy_config = getattr(policy, "config", {}) or {}
+
+    def get_config_value(cfg, key, default=None):
+        if hasattr(cfg, key):
+            value = getattr(cfg, key)
+        elif isinstance(cfg, dict):
+            value = cfg.get(key, default)
+        else:
+            value = default
+        return value if value is not None else default
+
     normalization_mapping = parse_mapping(args.normalization_mapping)
     if not normalization_mapping:
-        normalization_mapping = policy_config.get("normalization_mapping", {})
+        normalization_mapping = get_config_value(policy_config, "normalization_mapping", {})
 
-    input_features = args.input_features or policy_config.get("input_features") or []
-    output_features = args.output_features or policy_config.get("output_features") or []
+    policy_input_features = get_config_value(policy_config, "input_features", {})
+    policy_output_features = get_config_value(policy_config, "output_features", {})
+
+    if args.input_features:
+        if isinstance(policy_input_features, dict):
+            input_features = {k: v for k, v in policy_input_features.items() if k in args.input_features}
+        else:
+            input_features = {k: None for k in args.input_features}
+    else:
+        input_features = policy_input_features
+
+    if args.output_features:
+        if isinstance(policy_output_features, dict):
+            output_features = {k: v for k, v in policy_output_features.items() if k in args.output_features}
+        else:
+            output_features = {k: None for k in args.output_features}
+    else:
+        output_features = policy_output_features
+
+    combined_features = {}
+    if isinstance(input_features, dict):
+        combined_features.update(input_features)
+    if isinstance(output_features, dict):
+        combined_features.update(output_features)
 
     preprocessor, postprocessor = make_pre_post_processors(
-        policy_config,
-        ds.meta.stats,
-        input_features=input_features or None,
-        output_features=output_features or None,
-        normalization_mapping=normalization_mapping or None,
+        policy_cfg=policy_config,
+        pretrained_path=str(args.policy),
+        preprocessor_overrides={
+            "device_processor": {"device": str(device)},
+            "normalizer_processor": {
+                "stats": ds.meta.stats,
+                "features": combined_features or None,
+                "norm_map": normalization_mapping or None,
+            },
+            "tokenizer_processor": {
+                "task_key": "task",
+            },
+        },
+        postprocessor_overrides={
+            "unnormalizer_processor": {
+                "stats": ds.meta.stats,
+                "features": output_features or None,
+                "norm_map": normalization_mapping or None,
+            }
+        },
     )
 
     logging.info("Policy input features: %s", input_features)
