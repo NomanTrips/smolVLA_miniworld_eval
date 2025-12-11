@@ -415,28 +415,70 @@ def main() -> None:
         return batch
 
     def build_policy_transition(observation, render_frame):
-        raw_obs: dict[str, object] = {}
-        if isinstance(observation, dict):
-            for feature in input_features:
-                if feature in observation:
-                    raw_obs[feature] = observation[feature]
-            if "state" in observation and "state" not in raw_obs:
-                raw_obs["state"] = observation["state"]
+        def to_image_tensor(frame):
+            if isinstance(frame, torch.Tensor):
+                tensor = frame
+            else:
+                tensor = torch.from_numpy(np.asarray(frame))
+            if tensor.ndim == 3:  # HWC -> CHW
+                tensor = tensor.permute(2, 0, 1)
+            if tensor.ndim == 3:  # add batch
+                tensor = tensor.unsqueeze(0)
+            tensor = tensor.float()
+            if tensor.max().item() > 1.0:
+                tensor = tensor / 255.0
+            return tensor
 
-        for feature in input_features:
-            if feature in raw_obs:
+        def to_tensor(value):
+            if isinstance(value, torch.Tensor):
+                tensor = value
+            else:
+                tensor = torch.tensor(value)
+            tensor = tensor.float()
+            if tensor.ndim == 1:
+                tensor = tensor.unsqueeze(0)
+            return tensor
+
+        feature_names = list(input_features.keys()) if isinstance(input_features, dict) else list(input_features)
+        nested_obs: dict[str, object] = {}
+        flat_obs: dict[str, object] = {}
+
+        state_source = observation.get("state") if isinstance(observation, dict) else None
+        render_tensor = to_image_tensor(render_frame)
+
+        for feature in feature_names:
+            nested_key = feature.split("observation.", 1)[-1] if feature.startswith("observation.") else feature
+            value = None
+            if isinstance(observation, dict):
+                value = observation.get(feature)
+                if value is None and feature.startswith("observation."):
+                    value = observation.get(nested_key)
+
+            if value is None and any(token in feature for token in ("image", "rgb", "pixels")):
+                value = render_tensor
+            if value is None and "state" in feature and state_source is not None:
+                value = to_tensor(state_source)
+
+            if value is None:
                 continue
-            if feature in ("image", "rgb", "pixels"):
-                raw_obs[feature] = render_frame
 
-        if not raw_obs:
-            raw_obs["image" if "image" in input_features else "rgb"] = render_frame
+            flat_obs[feature] = value
+            nested_obs[nested_key] = value
 
-        return {
-            TransitionKey.OBSERVATION: raw_obs,
+        if not nested_obs:
+            default_key = "image" if "image" in feature_names else feature_names[0] if feature_names else "image"
+            nested_default_key = default_key.split("observation.", 1)[-1] if default_key.startswith("observation.") else default_key
+            nested_obs[nested_default_key] = render_tensor
+            flat_obs[default_key if default_key.startswith("observation.") else f"observation.{default_key}"] = render_tensor
+
+        transition = {
+            "observation": nested_obs,
+            TransitionKey.OBSERVATION: nested_obs,
             "task": args.task,
             TransitionKey.COMPLEMENTARY_DATA: {"task": args.task},
         }
+        transition.update(flat_obs)
+        return transition
 
     env = None
     manual_recorder: ManualVideoRecorder | None = None
