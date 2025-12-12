@@ -272,6 +272,7 @@ def setup_logging(outdir: Path) -> None:
             logging.StreamHandler(),
             logging.FileHandler(log_path, mode="a", encoding="utf-8"),
         ],
+        force=True,
     )
     logging.info("Logging initialized. Writing to %s", log_path)
 
