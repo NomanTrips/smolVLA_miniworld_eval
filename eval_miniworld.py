@@ -414,6 +414,25 @@ def main() -> None:
             return type(batch)(move_to_device(v) for v in batch)
         return batch
 
+    def summarize_action(value):
+        """Make action outputs logging-friendly while preserving numeric detail."""
+
+        def to_serializable(item):
+            if isinstance(item, torch.Tensor):
+                item = item.detach().cpu().numpy()
+            if isinstance(item, np.ndarray):
+                return item.tolist()
+            if isinstance(item, (list, tuple)):
+                return [to_serializable(x) for x in item]
+            if isinstance(item, dict):
+                return {k: to_serializable(v) for k, v in item.items()}
+            try:
+                return float(item)
+            except (TypeError, ValueError):
+                return item
+
+        return to_serializable(value)
+
     def build_policy_transition(observation, render_frame):
         def to_image_tensor(frame):
             if isinstance(frame, torch.Tensor):
@@ -578,7 +597,10 @@ def main() -> None:
                 processed_inputs = move_to_device(processed_inputs)
 
                 action_output = policy.select_action(processed_inputs)
+                logging.info("Model raw action output: %s", summarize_action(action_output))
+
                 action_post = postprocessor(action_output)
+                logging.info("Postprocessed action: %s", summarize_action(action_post))
                 action_value = (
                     action_post["action"] if isinstance(action_post, dict) and "action" in action_post else action_post
                 )
